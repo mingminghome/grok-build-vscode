@@ -7,19 +7,20 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 
 find_code_cli() {
-    for name in code code-insiders; do
+    for name in antigravity-ide antigravity code code-insiders; do
         if command -v "$name" >/dev/null 2>&1; then
             echo "$name"; return 0
         fi
     done
     # macOS install paths
     for path in \
+        "/Applications/Antigravity IDE.app/Contents/Resources/app/bin/antigravity-ide" \
         "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
         "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code-insiders" \
     ; do
         [ -x "$path" ] && { echo "$path"; return 0; }
     done
-    echo "Could not find VS Code CLI. Install VS Code or add 'code' to PATH." >&2
+    echo "Could not find VS Code / Antigravity CLI. Install VS Code / Antigravity or add 'code' / 'antigravity-ide' to PATH." >&2
     return 1
 }
 
@@ -38,4 +39,4 @@ echo "Installing $vsix via $code"
 # --force so a same-version reinstall actually overwrites the installed files
 "$code" --install-extension "$vsix" --force
 echo
-echo "Done. Reload VS Code (Ctrl+Shift+P -> 'Developer: Reload Window') and click the Grok icon."
+echo "Done. Reload VS Code / Antigravity (Ctrl+Shift+P -> 'Developer: Reload Window') and click the Grok icon."
