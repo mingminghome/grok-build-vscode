@@ -5,10 +5,14 @@ import {
   isReadOnlyCommand,
   isPlanFileWrite,
   isGrokPlanWriteCommand,
+  pickAllowOption,
   pickRejectOption,
   shouldBlockWrite,
   shouldBlockTerminal,
+  shouldAutoAllowPermission,
   shouldRejectPermission,
+  commandFromPermissionToolCall,
+  PLAN_PERMISSION_BLOCKED_MSG,
   PlanGateContext,
 } from "../src/plan-gate";
 
@@ -291,11 +295,43 @@ describe("permission gating", () => {
     expect(isMutatingKind(undefined)).toBe(false);
   });
 
-  it("auto-rejects mutating permission requests only while planning", () => {
+  it("auto-rejects edit/delete while planning; leaves read alone", () => {
     expect(shouldRejectPermission("edit", active("/p"))).toBe(true);
-    expect(shouldRejectPermission("execute", active("/p"))).toBe(true);
+    expect(shouldRejectPermission("delete", active("/p"))).toBe(true);
     expect(shouldRejectPermission("read", active("/p"))).toBe(false);
     expect(shouldRejectPermission("edit", off("/p"))).toBe(false);
+  });
+
+  it("execute: rejects mutating/unknown commands, allows read-only while planning", () => {
+    // No command (or missing) → reject (can't prove read-only).
+    expect(shouldRejectPermission("execute", active("/p"))).toBe(true);
+    expect(shouldRejectPermission("execute", active("/p"), {})).toBe(true);
+    expect(shouldRejectPermission("execute", active("/p"), { command: "npm install" })).toBe(true);
+    // Read-only exploration (incl. the logo/PWA inspect shape) → do NOT reject.
+    expect(shouldRejectPermission("execute", active("/p"), { command: "git status" })).toBe(false);
+    expect(shouldRejectPermission("execute", active("/p"), {
+      command: "file frontend/public/logo.png && sips -g pixelWidth -g pixelHeight frontend/public/logo.png; ls -la frontend/public",
+    })).toBe(false);
+    // Gate off → never reject.
+    expect(shouldRejectPermission("execute", off("/p"), { command: "rm -rf x" })).toBe(false);
+  });
+
+  it("shouldAutoAllowPermission only for read-only execute while planning", () => {
+    expect(shouldAutoAllowPermission("execute", active("/p"), { command: "ls -la" })).toBe(true);
+    expect(shouldAutoAllowPermission("execute", active("/p"), { command: "npm install" })).toBe(false);
+    expect(shouldAutoAllowPermission("edit", active("/p"))).toBe(false);
+    expect(shouldAutoAllowPermission("execute", off("/p"), { command: "ls" })).toBe(false);
+  });
+
+  it("commandFromPermissionToolCall reads rawInput.command", () => {
+    expect(commandFromPermissionToolCall({ rawInput: { command: "git status" } })).toBe("git status");
+    expect(commandFromPermissionToolCall({ rawInput: {} })).toBeUndefined();
+    expect(commandFromPermissionToolCall(undefined)).toBeUndefined();
+  });
+
+  it("notice text clarifies that answering questions is not plan approval", () => {
+    expect(PLAN_PERMISSION_BLOCKED_MSG.toLowerCase()).toContain("answering questions is not plan approval");
+    expect(PLAN_PERMISSION_BLOCKED_MSG.toLowerCase()).toContain("plan review");
   });
 
   it("pickRejectOption prefers reject_once, falls back, and bails when none", () => {
@@ -309,6 +345,42 @@ describe("permission gating", () => {
     ])).toBe("y");
     expect(pickRejectOption([{ optionId: "x", kind: "allow_once" }])).toBeUndefined();
     expect(pickRejectOption([])).toBeUndefined();
+  });
+
+  it("pickAllowOption prefers allow_always, then allow_once", () => {
+    expect(pickAllowOption([
+      { optionId: "r", kind: "reject_once" },
+      { optionId: "a", kind: "allow_once" },
+      { optionId: "aa", kind: "allow_always" },
+    ])).toBe("aa");
+    expect(pickAllowOption([
+      { optionId: "r", kind: "reject_once" },
+      { optionId: "a", kind: "allow_once" },
+    ])).toBe("a");
+    expect(pickAllowOption([{ optionId: "r", kind: "reject_once" }])).toBeUndefined();
+  });
+});
+
+describe("isReadOnlyCommand — sips + null redirects", () => {
+  it("allows property queries (-g) used for PWA icon sizing", () => {
+    expect(isReadOnlyCommand("sips -g pixelWidth -g pixelHeight frontend/public/logo.png")).toBe(true);
+    // Exact command from a live banking-session plan turn (incl. 2>/dev/null).
+    expect(isReadOnlyCommand(
+      "file frontend/public/logo.png frontend/public/logo.svg && sips -g pixelWidth -g pixelHeight frontend/public/logo.png 2>/dev/null; ls -la frontend/public/",
+    )).toBe(true);
+  });
+
+  it("blocks mutating sips forms", () => {
+    expect(isReadOnlyCommand("sips -z 192 192 logo.png --out icon-192.png")).toBe(false);
+    expect(isReadOnlyCommand("sips -s format jpeg logo.png")).toBe(false);
+    expect(isReadOnlyCommand("sips logo.png")).toBe(false); // no -g → not a query
+  });
+
+  it("allows >/dev/null noise redirects but still blocks real file redirects", () => {
+    expect(isReadOnlyCommand("ls 2>/dev/null")).toBe(true);
+    expect(isReadOnlyCommand("git status >/dev/null 2>&1")).toBe(true);
+    expect(isReadOnlyCommand("cat secrets > out.txt")).toBe(false);
+    expect(isReadOnlyCommand("ls 2>/tmp/err.txt")).toBe(false);
   });
 });
 

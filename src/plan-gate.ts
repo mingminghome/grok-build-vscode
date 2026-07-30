@@ -215,11 +215,53 @@ function isReadOnlyStage(stage: string): boolean {
     // Only allow trivially read-only invocations like `node --version`.
     return tokens.length >= 2 && /^(-v|--version|--help|-h)$/.test(tokens[1]);
   }
+  if (head === "sips") return isReadOnlySips(lowerTokens);
   if (head === "sed" && hasSedInPlace(lowerTokens.slice(1))) return false;
   if (head === "find" && hasToken(lowerTokens.slice(1), "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls")) return false;
   if (head === "fd" && hasToken(lowerTokens.slice(1), "-x", "--exec", "--exec-batch")) return false;
   if ((head === "sort" || head === "tree") && hasOutputOption(lowerTokens.slice(1))) return false;
   return READONLY_HEADS.has(head);
+}
+
+/**
+ * `sips` (macOS image tool): allow property queries only (`-g` / `--getProperty`).
+ * Resample/set/format/out forms rewrite image files and stay blocked.
+ */
+function isReadOnlySips(tokens: string[]): boolean {
+  const args = tokens.slice(1);
+  if (args.length === 0) return false;
+  let sawGet = false;
+  for (const t of args) {
+    if (t === "-g" || t === "--getproperty") {
+      sawGet = true;
+      continue;
+    }
+    if (
+      t === "-s" || t.startsWith("--set") ||
+      t === "-z" || t.startsWith("--resample") ||
+      t === "-r" || t.startsWith("--rotate") ||
+      t === "-f" || t.startsWith("--format") ||
+      t === "-o" || t.startsWith("--out") ||
+      t === "-d" || t.startsWith("--delete") ||
+      t.startsWith("--crop") || t.startsWith("--pad") ||
+      t === "--addicon" || t === "--optimizecolorforsharing"
+    ) {
+      return false;
+    }
+  }
+  return sawGet;
+}
+
+/**
+ * Drop redirects that cannot write workspace state (`2>/dev/null`, `>/dev/null`,
+ * `2>&1`). Agents often silence noise on inspect commands; those must not flip
+ * the whole chain to "unsafe" while real `> out.txt` redirects still block.
+ */
+function stripNullRedirects(cmd: string): string {
+  return cmd
+    .replace(/(?:\d+)?\s*>\s*\/dev\/null\b/gi, " ")
+    .replace(/&\s*>\s*\/dev\/null\b/gi, " ")
+    .replace(/(?:\d+)?\s*>&\s*\d+/g, " ");
 }
 
 /**
@@ -230,10 +272,16 @@ function isReadOnlyStage(stage: string): boolean {
  * program (with a read-only subcommand for git/npm/pnpm/yarn). So
  * `cd repo && git status` and `Get-ChildItem | Select-Object` pass, but
  * `cd repo && npm install`, `git status; rm -rf x`, and `cat x | iex` do not.
- * Everything else is blocked. Errs toward blocking.
+ * Harmless `2>/dev/null` redirects are stripped first. Everything else is
+ * blocked. Errs toward blocking.
  */
 export function isReadOnlyCommand(command: string): boolean {
-  const cmd = String(command || "").trim();
+  const raw = String(command || "").trim();
+  if (!raw) return false;
+  // Newlines are shell statement separators — refuse before we collapse
+  // whitespace (otherwise `ls\nrm -rf x` would look like `ls rm -rf x`).
+  if (/[\r\n]/.test(raw)) return false;
+  const cmd = stripNullRedirects(raw).replace(/[ \t]+/g, " ").trim();
   if (!cmd) return false;
   if (UNSAFE_SHELL.test(cmd)) return false;
   if (cmd.replace(/&&/g, "").includes("&")) return false; // lone & = backgrounding
@@ -298,9 +346,71 @@ export function shouldBlockTerminal(command: string, ctx: PlanGateContext): bool
   return true;
 }
 
-/** Should a `session/request_permission` for `toolKind` be auto-rejected? */
-export function shouldRejectPermission(toolKind: string | undefined, ctx: PlanGateContext): boolean {
-  return ctx.active && isMutatingKind(toolKind);
+export interface PlanPermissionInput {
+  /** ACP tool-call kind (`edit` / `execute` / `read` / …). */
+  kind?: string;
+  /**
+   * Shell command when `kind` is `execute` (from `toolCall.rawInput.command`).
+   * Used so read-only exploration is not auto-rejected during planning.
+   */
+  command?: string;
+}
+
+/**
+ * Notice when plan mode auto-rejects a mutating permission. Deliberately does
+ * **not** say only "approve the plan first" — users often just answered an
+ * `ask_user_question` card and think that counted as approval. Answering
+ * questions is not plan approval; the plan review card is.
+ */
+export const PLAN_PERMISSION_BLOCKED_MSG =
+  "Plan mode is still active — that action was blocked. Answering questions is not plan approval; wait for the plan review card, then Approve to implement.";
+
+/**
+ * Should a `session/request_permission` be auto-rejected while planning?
+ *
+ * - `edit` / `delete` / `move` / `write` → always reject (implementation).
+ * - `execute` → reject unless the command is known read-only (same allowlist as
+ *   `shouldBlockTerminal`). Missing/unknown command errs toward reject.
+ * - other kinds → allow through (read/search/fetch/etc.).
+ */
+export function shouldRejectPermission(
+  toolKind: string | undefined,
+  ctx: PlanGateContext,
+  input?: PlanPermissionInput,
+): boolean {
+  if (!ctx.active) return false;
+  const kind = String(toolKind ?? input?.kind ?? "").toLowerCase();
+  if (kind === "execute") {
+    const cmd = input?.command;
+    return !cmd || !isReadOnlyCommand(cmd);
+  }
+  return isMutatingKind(kind);
+}
+
+/**
+ * Should a permission be auto-allowed while planning (no card, no notice)?
+ * Mirrors the terminal gate: only read-only `execute` commands.
+ */
+export function shouldAutoAllowPermission(
+  toolKind: string | undefined,
+  ctx: PlanGateContext,
+  input?: PlanPermissionInput,
+): boolean {
+  if (!ctx.active) return false;
+  const kind = String(toolKind ?? input?.kind ?? "").toLowerCase();
+  if (kind !== "execute") return false;
+  const cmd = input?.command;
+  return !!cmd && isReadOnlyCommand(cmd);
+}
+
+/** Pull the shell command out of an ACP permission toolCall, if present. */
+export function commandFromPermissionToolCall(toolCall: {
+  rawInput?: unknown;
+} | undefined): string | undefined {
+  const ri = toolCall?.rawInput;
+  if (!ri || typeof ri !== "object") return undefined;
+  const cmd = (ri as { command?: unknown }).command;
+  return typeof cmd === "string" && cmd.trim() ? cmd : undefined;
 }
 
 export interface PermissionOptionLike {
@@ -320,6 +430,20 @@ export function pickRejectOption(options: PermissionOptionLike[]): string | unde
   if (exact) return exact.optionId;
   const anyReject = options.find((o) => /reject|deny|cancel|no/i.test(o.kind));
   return anyReject?.optionId;
+}
+
+/**
+ * Pick the option that means "yes". Prefers `allow_always`, then `allow_once`,
+ * then any allow/accept kind.
+ */
+export function pickAllowOption(options: PermissionOptionLike[]): string | undefined {
+  if (!Array.isArray(options) || options.length === 0) return undefined;
+  const always = options.find((o) => o.kind === "allow_always");
+  if (always) return always.optionId;
+  const once = options.find((o) => o.kind === "allow_once");
+  if (once) return once.optionId;
+  const anyAllow = options.find((o) => /allow|accept|yes/i.test(o.kind));
+  return anyAllow?.optionId;
 }
 
 /**

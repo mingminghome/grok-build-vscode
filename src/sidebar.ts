@@ -77,7 +77,14 @@ import {
   unreferencedUploadsForRemovedSessions,
 } from "./file-upload";
 import { MAX_DIFF_EXPAND_BYTES, expandDiffToWholeFile } from "./diff-view";
-import { pickRejectOption, shouldRejectPermission } from "./plan-gate";
+import {
+  PLAN_PERMISSION_BLOCKED_MSG,
+  commandFromPermissionToolCall,
+  pickAllowOption,
+  pickRejectOption,
+  shouldAutoAllowPermission,
+  shouldRejectPermission,
+} from "./plan-gate";
 import { appendPlanEntry, planRestoreSource, truncateResolvedAfter, countsAsUserBubble, decideRestoreState } from "./plan-restore";
 import { planReviewFileName, sanitizePlanReviewFilePart } from "./plan-review";
 import { GROK_PRIMER, isPrimerText, isPrimerSummary } from "./grok-primer";
@@ -2811,24 +2818,35 @@ See design doc for the full state machine diagram.`;
     });
     client.on("permissionRequest", (req: PermissionRequest) => {
       if (gen !== session.gen) return;
-      // While planning, decline any mutating permission outright. Agent mode
-      // skips this prompt for edits it deems safe — the fs/terminal gate is the
-      // real backstop — but if the CLI *does* ask, we say no without bothering
-      // the user.
-      if (session.planActive && shouldRejectPermission(req.toolCall?.kind, {
-        active: true,
-        workspaceRoot: cwd,
-      })) {
-        const rejectId = pickRejectOption(req.options);
-        if (rejectId) {
-          client.respondPermission(req.id, rejectId);
-          this.emit(session, {
-            type: "planNotice",
-            text: `Plan mode declined a ${req.toolCall?.kind ?? "tool"} request — approve the plan first.`,
-          });
-          return;
+      // While planning: auto-allow read-only shell (same allowlist as the
+      // terminal gate) so the post–ask_user_question continue turn can keep
+      // exploring; auto-reject true mutations. Answering questions is NOT plan
+      // approval — the notice text makes that explicit.
+      if (session.planActive) {
+        const planCtx = { active: true as const, workspaceRoot: cwd };
+        const permInput = {
+          kind: req.toolCall?.kind,
+          command: commandFromPermissionToolCall(req.toolCall),
+        };
+        if (shouldAutoAllowPermission(req.toolCall?.kind, planCtx, permInput)) {
+          const allowId = pickAllowOption(req.options);
+          if (allowId) {
+            client.respondPermission(req.id, allowId);
+            return;
+          }
         }
-        // No decline option offered — fall through and let the user decide.
+        if (shouldRejectPermission(req.toolCall?.kind, planCtx, permInput)) {
+          const rejectId = pickRejectOption(req.options);
+          if (rejectId) {
+            client.respondPermission(req.id, rejectId);
+            this.emit(session, {
+              type: "planNotice",
+              text: PLAN_PERMISSION_BLOCKED_MSG,
+            });
+            return;
+          }
+          // No decline option offered — fall through and let the user decide.
+        }
       }
       if (session.autoApprove) {
         const opt = req.options.find((o) => o.kind === "allow_always") ??
